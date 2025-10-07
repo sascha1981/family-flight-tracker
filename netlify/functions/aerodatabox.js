@@ -1,88 +1,76 @@
 export async function handler(event) {
   const key = process.env.AERODATABOX_KEY;
   if (!key) {
-    return { statusCode: 401, body: JSON.stringify({ error: 'missing AERODATABOX_KEY env' }) };
+    return json(401, { error: 'missing AERODATABOX_KEY env' });
   }
 
   const { flight, date } = event.queryStringParameters || {};
   if (!flight || !date) {
-    return { statusCode: 400, body: JSON.stringify({ error: 'missing params flight,date' }) };
+    return json(400, { error: 'missing params flight,date' });
   }
 
-  const term = String(flight).replace(/\s+/g, '').toUpperCase();
+  // helper: JSON response
+  function json(status, data) {
+    return {
+      statusCode: status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' },
+      body: JSON.stringify(data),
+    };
+  }
+
   const base = 'https://aerodatabox.p.rapidapi.com';
+  const clean = (s) => String(s || '').replace(/\s+/g, '').toUpperCase();
+
+  // 1) Normalize/codeshare map (United -> Lufthansa)
+  const rawTerm = clean(flight);
+  const map = {
+    UA8839: 'LH402', // FRA -> EWR
+    UA8838: 'LH401', // EWR -> FRA
+  };
+  const term = map[rawTerm] || rawTerm;
 
   const mkNumberUrl = (num, searchBy) =>
     `${base}/flights/number/${encodeURIComponent(num)}/${encodeURIComponent(date)}?withLocation=true&withCodeshares=true&searchBy=${searchBy}`;
 
-  async function fetchJSON(u) {
+  async function fetchTxt(u) {
     const r = await fetch(u, {
-      headers: {
-        'x-rapidapi-key': key,
-        'x-rapidapi-host': 'aerodatabox.p.rapidapi.com',
-      },
+      headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'aerodatabox.p.rapidapi.com' },
     });
     const text = await r.text();
     return { ok: r.ok, status: r.status, text };
   }
 
-  // 1) Versuch: IATA (UA8839, LH402, …)
-  let res = await fetchJSON(mkNumberUrl(term, 'Iata'));
-  if (res.ok) {
-    return {
-      statusCode: 200,
-      headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
-      body: res.text,
-    };
-  }
+  // Try by number (IATA then ICAO)
+  let r = await fetchTxt(mkNumberUrl(term, 'Iata'));
+  if (r.ok && r.text) return { statusCode: 200, headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' }, body: r.text };
 
-  // 2) Versuch: ICAO
-  res = await fetchJSON(mkNumberUrl(term, 'Icao'));
-  if (res.ok) {
-    return {
-      statusCode: 200,
-      headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
-      body: res.text,
-    };
-  }
+  r = await fetchTxt(mkNumberUrl(term, 'Icao'));
+  if (r.ok && r.text) return { statusCode: 200, headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' }, body: r.text };
 
-  // 3) Codeshare-/Fallback-Suche
-  const searchUrl = `${base}/flights/search/term?q=${encodeURIComponent(term)}`;
-  const s = await fetchJSON(searchUrl);
-
-  if (s.ok) {
-    // s.text ist ein JSON-Array mit Treffern; nimm den ersten und rufe die Detail-API erneut auf
+  // Fallback: search term -> pick first match, then resolve again
+  const s = await fetchTxt(`${base}/flights/search/term?q=${encodeURIComponent(term)}`);
+  if (s.ok && s.text) {
     try {
       const arr = JSON.parse(s.text);
-      if (Array.isArray(arr) && arr.length > 0) {
-        // "number" kommt oft mit Leerzeichen, z.B. "LH 402" -> "LH402"
-        const num = String(arr[0]?.number || '').replace(/\s+/g, '');
-        if (num) {
-          // Nochmal mit IATA auflösen
-          const byNum = await fetchJSON(mkNumberUrl(num, 'Iata'));
-          if (byNum.ok) {
-            return {
-              statusCode: 200,
-              headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
-              body: byNum.text,
-            };
+      if (Array.isArray(arr) && arr.length) {
+        // Prefer operating flight if present, otherwise first number
+        const first = arr[0];
+        const cand = clean(first?.operatingFlight?.number || first?.number || '');
+        if (cand) {
+          let byNum = await fetchTxt(mkNumberUrl(cand, 'Iata'));
+          if (!byNum.ok || !byNum.text) byNum = await fetchTxt(mkNumberUrl(cand, 'Icao'));
+          if (byNum.ok && byNum.text) {
+            return { statusCode: 200, headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' }, body: byNum.text };
           }
         }
       }
-    } catch { /* ignore JSON parse error */ }
-
-    // Wenn nur Suchliste vorliegt, gib sie zurück – **mit 200**, NICHT 400
-    return {
-      statusCode: 200,
-      headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
-      body: s.text,
-    };
+      // Return search list so Frontend kann was anzeigen
+      return json(200, { results: arr || [], info: 'search_results_only' });
+    } catch {
+      // search returned non-JSON? fall through
+    }
   }
 
-  // Letzter Fallback: Fehler-Body vom besten Versuch liefern
-  return {
-    statusCode: res.status || 502,
-    headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
-    body: res.text || JSON.stringify({ error: 'aerodatabox_failed' }),
-  };
+  // Last resort: never return empty body
+  return json(r.status || 404, { error: 'no_data', tried: { term, iataTried: true, icaoTried: true } });
 }
